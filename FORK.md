@@ -50,6 +50,12 @@ Both fields are set **at creation**, inside the same `add-shopping-list-item`
 operation. There is no follow-up update that can fail and leave an item
 half-tagged.
 
+`addItem()` does not always create, though. If a matching item exists and is
+**checked**, it revives that one rather than adding a duplicate — the common
+case for anything bought before. Revived items are re-sent through the
+`update-list-item` handler, which takes a whole `ListItem`, because
+`Item.save()` emits per-field operations and no handler exists for `storeIds`.
+
 ## Deploying
 
 The slug stays `anylist`. Home Assistant keys an install on the slug, and the

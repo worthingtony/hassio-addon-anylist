@@ -1,6 +1,6 @@
 {
   "name": "Anylist (store tags fork)",
-  "version": "1.7.3-storetags.1",
+  "version": "1.7.3-storetags.2",
   "init": false,
   "slug": "anylist",
   "description": "Anylist REST API - fork: reads and writes ListItem.storeIds and productUpc",

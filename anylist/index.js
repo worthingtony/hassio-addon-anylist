@@ -101,6 +101,50 @@ function attachExtraFields(item, updates) {
     return item;
 }
 
+/*
+ * FORK ADDITION: set storeIds / productUpc on an item that already exists.
+ *
+ * Item.save() cannot do it. It emits one per-field operation per changed
+ * property, keyed by a handler id, and there is no handler for storeIds. But
+ * "update-list-item" takes a whole ListItem, so re-sending the augmented
+ * encoding works.
+ *
+ * This matters more than it looks. addItem() revives an existing *checked*
+ * item rather than creating a duplicate, which is the common case for anything
+ * bought before. Without this, a revived item carries no productUpc, so the
+ * reconciler cannot tell it came from Grocy and never books the purchase back
+ * -- and if it were bound for a specialty store it would stay untagged and
+ * invisible there.
+ */
+function randomItemId() {
+    let hex = "";
+    for (let i = 0; i < 32; i++) {
+        hex += Math.floor(Math.random() * 16).toString(16);
+    }
+    return hex;
+}
+
+async function saveWholeItem(any, list, item) {
+    const FormData = require("form-data");
+
+    let op = new any.protobuf.PBListOperation();
+    op.setMetadata({
+        operationId: randomItemId(),
+        handlerId: "update-list-item",
+        userId: any.uid
+    });
+    op.setListId(list.identifier);
+    op.setListItemId(item.identifier);
+    op.setListItem(item._encode());
+
+    let ops = new any.protobuf.PBListOperationList();
+    ops.setOperations([op]);
+
+    let form = new FormData();
+    form.append("operations", ops.toBuffer());
+    await any.client.post("data/shopping-lists/update", {body: form});
+}
+
 async function getStores() {
     return initialize(async (any) => {
         let data = await any._getUserData(false);
@@ -254,7 +298,14 @@ async function addItem(listName, itemName, updates) {
         } else if (item.checked) {
             populateItemUpdates(item, updates);
             item.checked = false;
-            await item.save();
+            // A revived item must carry the same fields a new one would, or it
+            // is invisible to the reconciler and to specialty store filters.
+            let tagged = attachExtraFields(item, updates);
+            if (tagged !== item || updates["storeIds"] || updates["productUpc"]) {
+                await saveWholeItem(any, list, item);
+            } else {
+                await item.save();
+            }
             return 200;
         } else {
             return 304;
