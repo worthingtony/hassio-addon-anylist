@@ -32,6 +32,118 @@ function getListByName(any, name) {
     return any.lists.find(l => normalizeListName(l.name) === normalizeListName(name));
 }
 
+/*
+ * FORK ADDITION: storeIds and productUpc.
+ *
+ * AnyList's schema has carried both for years -- ListItem.storeIds is field 16
+ * and productUpc is field 30, and definitions.json in the anylist package
+ * already describes them. What is missing is the JS Item wrapper, which models
+ * nine fields and silently drops the rest on the way in and out.
+ *
+ * So this does not touch the anylist package. Reads come from the decoded
+ * protobuf the library already caches; writes augment the object Item._encode
+ * hands to the protobuf constructor, which accepts any field the schema knows.
+ *
+ * Why it matters: AnyList store filters split into two kinds. General ones set
+ * includesUnassignedItems, so an untagged item shows up there anyway. Specialty
+ * ones do not -- an item that does not name the store is invisible in its view.
+ * Without storeIds, nothing can route an item to Empire Fish or Wild Fork.
+ */
+async function rawItemFields(any) {
+    // The library caches the decoded PBUserDataResponse; ask for the cached
+    // copy rather than forcing another round trip.
+    let data = await any._getUserData(false);
+    let index = new Map();
+    let response = data && data.shoppingListsResponse;
+    if (!response) {
+        return index;
+    }
+
+    for (let list of [...(response.newLists || []), ...(response.modifiedLists || [])]) {
+        for (let item of (list.items || [])) {
+            index.set(item.identifier, {
+                storeIds: item.storeIds || [],
+                productUpc: item.productUpc || null
+            });
+        }
+    }
+
+    return index;
+}
+
+/*
+ * Make one item carry storeIds and productUpc when it is encoded.
+ *
+ * Item._encode() builds a plain object and passes it to the ListItem protobuf
+ * constructor. Adding fields to that object is enough -- the schema already
+ * knows them -- so this wraps _encode instead of reimplementing the whole
+ * add operation.
+ */
+function attachExtraFields(item, updates) {
+    let storeIds = Array.isArray(updates["storeIds"]) ? updates["storeIds"] : null;
+    let productUpc = updates["productUpc"] || null;
+    if (!storeIds && !productUpc) {
+        return item;
+    }
+
+    let encode = item._encode.bind(item);
+    item._encode = () => {
+        let encoded = encode();
+        if (storeIds) {
+            encoded.storeIds = storeIds;
+        }
+        if (productUpc) {
+            encoded.productUpc = productUpc;
+        }
+        return encoded;
+    };
+
+    return item;
+}
+
+async function getStores() {
+    return initialize(async (any) => {
+        let data = await any._getUserData(false);
+        let response = data && data.shoppingListsResponse;
+        if (!response) {
+            return null;
+        }
+
+        let listNames = new Map();
+        for (let list of any.lists) {
+            listNames.set(list.identifier, list.name);
+        }
+
+        let stores = [];
+        let filters = [];
+        for (let listResponse of (response.listResponses || [])) {
+            let listName = listNames.get(listResponse.listId) || null;
+            for (let store of (listResponse.stores || [])) {
+                stores.push({
+                    id: store.identifier,
+                    name: store.name,
+                    list: listName,
+                    sortIndex: store.sortIndex || 0
+                });
+            }
+
+            for (let filter of (listResponse.storeFilters || [])) {
+                filters.push({
+                    id: filter.identifier,
+                    name: filter.name,
+                    list: listName,
+                    storeIds: filter.storeIds || [],
+                    // The distinction that decides whether tagging is optional.
+                    includesUnassignedItems: filter.includesUnassignedItems || false,
+                    showsAllItems: filter.showsAllItems || false
+                });
+            }
+        }
+
+        return {stores: stores, filters: filters};
+    });
+}
+
 async function getItems(listName) {
     return initialize(async (any) => {
         let list = getListByName(any, listName);
@@ -39,14 +151,18 @@ async function getItems(listName) {
             return null;
         }
 
+        let extra = await rawItemFields(any);
         let items = list.items
         return items
             .map(item => {
+                let more = extra.get(item.identifier) || {};
                 return {
                     name: item.name,
                     id: item.identifier,
                     checked: item.checked || false,
-                    notes: item.details || ""
+                    notes: item.details || "",
+                    storeIds: more.storeIds || [],
+                    productUpc: more.productUpc || null
                 };
             });
     });
@@ -130,6 +246,9 @@ async function addItem(listName, itemName, updates) {
             let newItem = any.createItem({name: itemName, categoryMatchId: category});
             populateItemUpdates(newItem, updates);
             newItem.checked = false;
+            // Set at creation, in the same operation. There is no follow-up
+            // update that can fail and leave the item half-tagged.
+            attachExtraFields(newItem, updates);
             await list.addItem(newItem);
             return 200;
         } else if (item.checked) {
@@ -264,6 +383,22 @@ app.post("/add", async (req, res) => {
 
     let code = await addItem(listName, item, req.body);
     res.sendStatus(code);
+});
+
+app.get("/stores", async (req, res) => {
+    if (!enforceRequestSource(req, res)) {
+        return;
+    }
+
+    let result = await getStores();
+    if (result == null) {
+        res.sendStatus(500);
+        return;
+    }
+
+    res.status(200);
+    res.header("Content-Type", "application/json");
+    res.send(JSON.stringify(result));
 });
 
 app.post("/remove", async (req, res) => {
