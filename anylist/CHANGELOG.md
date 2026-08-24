@@ -1,3 +1,20 @@
+## 1.7.3-storetags.3
+
+Corrects .2, which did not work.
+
+.2 tried to give an already-existing item `storeIds` by re-sending a whole
+`ListItem` through the `update-list-item` handler. **AnyList accepts that
+operation, reports success, and silently applies only a subset of fields.**
+`storeIds` and `productUpc` are not in that subset. Verified twice -- through
+this add-on, and from an independent Python client -- so it is AnyList's
+behaviour, not an encoding bug here.
+
+Both fields are honoured **only at creation**. So a revive that needs either is
+now done as create-then-remove: add a fresh item carrying the fields, then
+delete the old checked one. Create first on purpose. If the create fails,
+nothing is lost; delete-first would drop the item outright. If the delete fails
+instead, the leftover is a checked duplicate -- visible and harmless.
+
 ## 1.7.3-storetags.2
 
 Fixes a real gap in .1: `storeIds` and `productUpc` were only attached when an

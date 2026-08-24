@@ -102,47 +102,45 @@ function attachExtraFields(item, updates) {
 }
 
 /*
- * FORK ADDITION: set storeIds / productUpc on an item that already exists.
+ * FORK ADDITION: giving an ALREADY-EXISTING item storeIds / productUpc.
  *
- * Item.save() cannot do it. It emits one per-field operation per changed
- * property, keyed by a handler id, and there is no handler for storeIds. But
- * "update-list-item" takes a whole ListItem, so re-sending the augmented
- * encoding works.
+ * You cannot. Both fields are only honoured when an item is created.
  *
- * This matters more than it looks. addItem() revives an existing *checked*
- * item rather than creating a duplicate, which is the common case for anything
- * bought before. Without this, a revived item carries no productUpc, so the
- * reconciler cannot tell it came from Grocy and never books the purchase back
- * -- and if it were bound for a specialty store it would stay untagged and
- * invisible there.
+ * Item.save() was never going to work -- it emits one per-field operation per
+ * changed property, keyed by handler id, and no handler exists for storeIds.
+ * The obvious next move, re-sending a whole ListItem through the
+ * "update-list-item" handler, was tried and VERIFIED NOT TO WORK: AnyList
+ * accepts the operation, returns success, and silently applies only a subset
+ * of fields. storeIds and productUpc are not in it. That was confirmed twice,
+ * once through this add-on and once from an independent Python client, so it
+ * is AnyList's behaviour and not a bug in the encoding here.
+ *
+ * That matters because addItem() does not always create. When a matching item
+ * exists and is checked it revives that item, which is the common case for
+ * anything the household has bought before -- and this list carries years of
+ * checked history. A revived item with no productUpc is invisible to the
+ * reconciler, so the purchase never gets booked back into Grocy, and one bound
+ * for a specialty store stays untagged and invisible in its filter.
+ *
+ * So a revive that needs either field is done as create-then-remove: add a
+ * fresh item carrying the fields, then delete the old checked one. Create
+ * first on purpose -- if the create fails nothing has been lost, whereas
+ * delete-first would drop the item on a failure. If the delete fails instead,
+ * the leftover is a checked duplicate, which is visible and harmless.
  */
-function randomItemId() {
-    let hex = "";
-    for (let i = 0; i < 32; i++) {
-        hex += Math.floor(Math.random() * 16).toString(16);
+async function replaceCheckedItem(any, list, oldItem, itemName, updates) {
+    let category = lookupItemCategory(any, list.identifier, itemName);
+    let newItem = any.createItem({name: itemName, categoryMatchId: category});
+    populateItemUpdates(newItem, updates);
+    newItem.checked = false;
+    attachExtraFields(newItem, updates);
+
+    await list.addItem(newItem);
+    try {
+        await list.removeItem(oldItem);
+    } catch (err) {
+        console.log(`Could not remove superseded item ${oldItem.identifier}: ${err}`);
     }
-    return hex;
-}
-
-async function saveWholeItem(any, list, item) {
-    const FormData = require("form-data");
-
-    let op = new any.protobuf.PBListOperation();
-    op.setMetadata({
-        operationId: randomItemId(),
-        handlerId: "update-list-item",
-        userId: any.uid
-    });
-    op.setListId(list.identifier);
-    op.setListItemId(item.identifier);
-    op.setListItem(item._encode());
-
-    let ops = new any.protobuf.PBListOperationList();
-    ops.setOperations([op]);
-
-    let form = new FormData();
-    form.append("operations", ops.toBuffer());
-    await any.client.post("data/shopping-lists/update", {body: form});
 }
 
 async function getStores() {
@@ -296,16 +294,17 @@ async function addItem(listName, itemName, updates) {
             await list.addItem(newItem);
             return 200;
         } else if (item.checked) {
+            let wantsExtras = (Array.isArray(updates["storeIds"]) && updates["storeIds"].length)
+                || updates["productUpc"];
+            if (wantsExtras) {
+                // Cannot be set on an existing item; replace it instead.
+                await replaceCheckedItem(any, list, item, itemName, updates);
+                return 200;
+            }
+
             populateItemUpdates(item, updates);
             item.checked = false;
-            // A revived item must carry the same fields a new one would, or it
-            // is invisible to the reconciler and to specialty store filters.
-            let tagged = attachExtraFields(item, updates);
-            if (tagged !== item || updates["storeIds"] || updates["productUpc"]) {
-                await saveWholeItem(any, list, item);
-            } else {
-                await item.save();
-            }
+            await item.save();
             return 200;
         } else {
             return 304;

@@ -50,11 +50,26 @@ Both fields are set **at creation**, inside the same `add-shopping-list-item`
 operation. There is no follow-up update that can fail and leave an item
 half-tagged.
 
-`addItem()` does not always create, though. If a matching item exists and is
-**checked**, it revives that one rather than adding a duplicate — the common
-case for anything bought before. Revived items are re-sent through the
-`update-list-item` handler, which takes a whole `ListItem`, because
-`Item.save()` emits per-field operations and no handler exists for `storeIds`.
+### Both fields are creation-only
+
+`storeIds` and `productUpc` **cannot be set on an item that already exists.**
+`Item.save()` emits per-field operations and no handler exists for `storeIds`;
+and re-sending a whole `ListItem` through `update-list-item` does not work
+either — AnyList accepts it, reports success, and silently applies only a
+subset of fields that excludes both. That was verified through this add-on and
+independently from a Python client, so it is AnyList's behaviour.
+
+This bites because `addItem()` does not always create. If a matching item
+exists and is **checked**, it revives that one rather than adding a duplicate —
+the common case for anything bought before, and this list carries years of
+checked history. A revived item with no `productUpc` is invisible to the
+reconciler, so the purchase is never booked back into Grocy.
+
+So a revive that needs either field is done as **create-then-remove**: add a
+fresh item carrying the fields, then delete the old checked one. Create first
+deliberately — a failed create loses nothing, while delete-first would drop the
+item. A failed delete leaves a checked duplicate, which is visible and
+harmless.
 
 ## Deploying
 
