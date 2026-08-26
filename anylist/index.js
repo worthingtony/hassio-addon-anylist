@@ -462,18 +462,33 @@ app.use(express.json());
 // than in nine handlers means a route added later cannot reintroduce it.
 for (const method of ["get", "post"]) {
     const register = app[method].bind(app);
-    app[method] = (path, handler) => register(path, async (req, res) => {
-        try {
-            await handler(req, res);
-        } catch (err) {
-            console.error(`${method.toUpperCase()} ${path} failed: ${err && err.message}`);
-            if (!res.headersSent) {
-                // 503, not 500: this is "upstream is refusing us, try later",
-                // and the caller should back off rather than treat it as a bug.
-                res.sendStatus(503);
-            }
+    app[method] = (...args) => {
+        // `app.get` is DUAL-PURPOSE: with a single argument it reads an
+        // application setting, and Express calls it internally -- res.send()
+        // asks for "json spaces" and "json escape". Wrapping that form turns a
+        // settings read into a route registration and hands the caller the app
+        // object instead of the value. Only wrap an actual route: two or more
+        // arguments, the last of which is a handler.
+        const handler = args[args.length - 1];
+        if (args.length < 2 || typeof handler !== "function") {
+            return register(...args);
         }
-    });
+        const path = args[0];
+        const rest = args.slice(0, -1);
+        return register(...rest, async (req, res, next) => {
+            try {
+                await handler(req, res, next);
+            } catch (err) {
+                console.error(`${method.toUpperCase()} ${path} failed: ${err && err.message}`);
+                if (res && !res.headersSent) {
+                    // 503, not 500: this is "upstream is refusing us, try
+                    // later", and the caller should back off rather than treat
+                    // it as a bug in the request.
+                    res.sendStatus(503);
+                }
+            }
+        });
+    };
 }
 
 app.get("/lists", async (req, res) => {
