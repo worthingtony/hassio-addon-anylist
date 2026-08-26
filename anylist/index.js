@@ -11,11 +11,93 @@ const IP_FILTER = args["ip-filter"] || process.env.IP_FILTER;
 const DEFAULT_LIST = args["default-list"] || process.env.DEFAULT_LIST;
 const CREDENTIALS_FILE = args["credentials-file"] || process.env.CREDENTIALS_FILE;
 
+// ---------------------------------------------------------------------------
+// ONE session, reused.
+//
+// This function used to build a new AnyList client, log in, and fetch the whole
+// user's lists on EVERY HTTP request. Nine routes call it, and the Home
+// Assistant side calls those routes constantly: a coordinator poll, a trigger
+// on every list-signature change, and a periodic sweep that reads five lists
+// one at a time. Each of those was a fresh login plus a full user-data fetch.
+//
+// On 2026-08-26 AnyList started answering /data/user-data/get with 401. The
+// upstream client responds to a 401 by refreshing its token and retrying, with
+// no cap -- 33 refresh cycles in one boot, each one a new authentication
+// request aimed at the service already refusing us. A request eventually
+// tarpitted (TCP connected in 23ms, TLS never completed, socket held for 959
+// seconds), the rejection went unhandled, node died, and the add-on restarted
+// on boot:auto to do it again.
+//
+// Logging in once and keeping the session removes ~99% of that traffic. The
+// rest of this block makes sure that when AnyList does push back, we degrade to
+// stale data instead of a crash loop.
+// ---------------------------------------------------------------------------
+
+const MAX_CONSECUTIVE_FAILURES = 3;
+const COOLDOWN_MS = 5 * 60 * 1000;
+
+let client = null;          // the live session
+let clientPromise = null;   // in-flight login, so concurrent requests share one
+let consecutiveFailures = 0;
+let cooldownUntil = 0;
+
+async function getClient() {
+    if (client) {
+        return client;
+    }
+    // Without this guard, five sweep requests arriving together would each
+    // start their own login -- which is the storm this change exists to stop.
+    if (!clientPromise) {
+        clientPromise = (async () => {
+            const any = new AnyList({email: EMAIL, password: PASSWORD, credentialsFile: CREDENTIALS_FILE});
+            await any.login(false);
+            await any.getLists();
+            return any;
+        })();
+        clientPromise
+            .then(any => { client = any; console.log("AnyList session established"); })
+            .catch(() => {})
+            .finally(() => { clientPromise = null; });
+    }
+    return clientPromise;
+}
+
 async function initialize(onInitialized) {
-    let any = new AnyList({email: EMAIL, password: PASSWORD, credentialsFile: CREDENTIALS_FILE});
-    await any.login(false);
-    await any.getLists();
-    return await onInitialized(any);
+    if (Date.now() < cooldownUntil) {
+        const secs = Math.ceil((cooldownUntil - Date.now()) / 1000);
+        throw new Error(`AnyList cooldown: ${secs}s remaining after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
+    }
+
+    let any;
+    try {
+        any = await getClient();
+    } catch (err) {
+        noteFailure(err, "login");
+        throw err;
+    }
+
+    try {
+        const result = await onInitialized(any);
+        consecutiveFailures = 0;
+        return result;
+    } catch (err) {
+        // Drop the session: a 401 here means this one is no longer accepted,
+        // so the next request logs in afresh -- ONCE, not in a loop.
+        client = null;
+        noteFailure(err, "request");
+        throw err;
+    }
+}
+
+function noteFailure(err, phase) {
+    consecutiveFailures += 1;
+    console.error(`AnyList ${phase} failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${err && err.message}`);
+    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        cooldownUntil = Date.now() + COOLDOWN_MS;
+        consecutiveFailures = 0;
+        console.error(`AnyList is refusing us. Backing off for ${COOLDOWN_MS / 60000} minutes ` +
+                      `rather than retrying -- retrying is what turns a throttle into a block.`);
+    }
 }
 
 async function getLists() {
@@ -373,6 +455,27 @@ function enforceRequestSource(req, res) {
 const app = express();
 app.use(express.json());
 
+// Express 4 does NOT catch a rejected promise from an async handler: it becomes
+// an unhandled rejection, and node's default is to kill the process. That is
+// the literal crash in the 2026-08-26 logs --
+// `triggerUncaughtException(err, true /* fromPromise */)`. Wrapping here rather
+// than in nine handlers means a route added later cannot reintroduce it.
+for (const method of ["get", "post"]) {
+    const register = app[method].bind(app);
+    app[method] = (path, handler) => register(path, async (req, res) => {
+        try {
+            await handler(req, res);
+        } catch (err) {
+            console.error(`${method.toUpperCase()} ${path} failed: ${err && err.message}`);
+            if (!res.headersSent) {
+                // 503, not 500: this is "upstream is refusing us, try later",
+                // and the caller should back off rather than treat it as a bug.
+                res.sendStatus(503);
+            }
+        }
+    });
+}
+
 app.get("/lists", async (req, res) => {
     if (!enforceRequestSource(req, res)) {
         return;
@@ -519,6 +622,12 @@ app.post("/check", async (req, res) => {
 
     let code = await checkItem(listName, itemName, checked);
     res.sendStatus(code);
+});
+
+// Last resort. Nothing above should let a rejection escape, but the upstream
+// client owns its own retry loop and this add-on must not die because of it.
+process.on("unhandledRejection", (err) => {
+    console.error(`Unhandled rejection (ignored, not fatal): ${err && err.message}`);
 });
 
 function start() {

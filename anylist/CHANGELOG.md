@@ -1,3 +1,29 @@
+## 1.7.3-storetags.4
+
+Log in ONCE and keep the session, instead of a fresh login plus a full
+user-data fetch on every HTTP request. Nine routes went through `initialize()`
+and Home Assistant calls them constantly -- a coordinator poll, a trigger on
+every list-signature change, and a 30-minute sweep reading five lists one at a
+time. That was roughly 1,700 logins a day for data that changes a few times a
+day.
+
+On 2026-08-26 AnyList began answering `/data/user-data/get` with 401. The
+upstream client refreshes its token and retries with no cap, so this became 33
+authentication attempts per boot aimed at the service already refusing us,
+until a request tarpitted (TLS never completed, socket held 959 seconds), the
+rejection went unhandled and node exited -- then `boot: auto` restarted it.
+
+Three fixes:
+
+- **One session, reused**, with an in-flight guard so concurrent requests share
+  a single login rather than starting five.
+- **A circuit breaker.** After 3 consecutive failures, refuse to call AnyList
+  for 5 minutes. Retrying is what turns a throttle into a block.
+- **Async route errors can no longer kill the process.** Express 4 does not
+  catch a rejected promise from an async handler; handlers are now wrapped once
+  at registration, so a route added later cannot reintroduce the crash. A
+  failure returns 503 -- "upstream is refusing us", not "this is a bug".
+
 ## 1.7.3-storetags.3
 
 Corrects .2, which did not work.
