@@ -1,3 +1,16 @@
+## 1.7.3-storetags.5
+
+Fixes the route wrapper added in .4, which broke `res.send()`.
+
+`app.get` is **dual-purpose** in Express: with a single argument it reads an
+application setting, and Express calls it internally -- `res.send()` asks for
+`"json spaces"` and `"json escape"`. Wrapping that form turned a settings read
+into a route registration and returned the app object instead of the value, so
+every response failed with `Cannot read properties of undefined (reading
+'headersSent')`.
+
+Only actual routes are wrapped now: two or more arguments, the last a function.
+
 ## 1.7.3-storetags.4
 
 Log in ONCE and keep the session, instead of a fresh login plus a full
