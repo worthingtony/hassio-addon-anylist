@@ -85,6 +85,14 @@ repository URL already gives this fork its own prefix, so it installs
 4. Verify by behaviour, not by exit code:
    `curl -s localhost:8080/stores | head` should list stores and filters.
 
+**The store URL stays on `tonyinwi` on purpose.** The repo moved to
+[worthingtony/hassio-addon-anylist](https://github.com/worthingtony/hassio-addon-anylist)
+on 2026-10-09, and GitHub redirects the old address. Supervisor's prefix is
+`sha1(store URL)[:8]` — that's where `0d0c4d7e` comes from — so adding the new URL would
+install a separate add-on with no config, not move this one. **Never create or fork a repo
+called `hassio-addon-anylist` under `tonyinwi`**: it kills the redirect and the store stops
+updating. A fresh install elsewhere can use the `worthingtony` URL.
+
 Rebuilding after a push needs **`ha store reload` first, then `ha apps rebuild`** —
 a rebuild alone does not `git pull`. That lesson cost real time on the
 barcodebuddy fork; see `barcodebuddy/FORK.md` in `kitchen-stack`.
